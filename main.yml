@@ -1,0 +1,211 @@
+---
+- name: Setup LEMP and WordPress
+  hosts: web
+  become: yes
+  vars_files:
+    - vars.yml
+    - secrets.yml
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required LEMP packages
+      apt:
+        name:
+          - nginx
+          - mariadb-server
+          - php-fpm
+          - php-mysql
+          - php-curl
+          - php-gd
+          - php-mbstring
+          - php-xml
+          - php-zip
+          - python3-pymysql # Needed for Ansible to configure the database
+          - acl # Needed for Ansible user permissions
+        state: present
+
+    - name: Ensure Nginx and MariaDB are enabled and running
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - nginx
+        - mariadb
+
+    - name: Create SFTP user with hashed password
+      user:
+        name: "{{ wp_user }}"
+        password: "{{ wp_user_pass | password_hash('sha512', 'mysalt') }}"
+        shell: /bin/false # Prevents standard SSH shell access
+        state: present
+
+    - name: Set root ownership on home directory for SFTP Chroot requirement
+      file:
+        path: "/home/{{ wp_user }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create website public directory structure
+      file:
+        path: "/home/{{ wp_user }}/{{ domain_name }}/public"
+        state: directory
+        owner: "{{ wp_user }}"
+        group: "{{ wp_user }}"
+        mode: '0755'
+
+    - name: Configure SFTP chroot in sshd_config
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED BLOCK FOR SFTP"
+        block: |
+          Match User {{ wp_user }}
+              ForceCommand internal-sftp
+              PasswordAuthentication yes
+              ChrootDirectory /home/{{ wp_user }}
+              PermitTunnel no
+              AllowAgentForwarding no
+              AllowTcpForwarding no
+              X11Forwarding no
+      notify: Restart SSH
+
+    - name: Create WordPress database
+      community.mysql.mysql_db:
+        name: "{{ db_name }}"
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+
+    - name: Create WordPress database user
+      community.mysql.mysql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_pass }}"
+        priv: "{{ db_name }}.*:ALL"
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+
+    - name: Download and extract phpMyAdmin
+      unarchive:
+        src: https://files.phpmyadmin.net/phpMyAdmin/5.2.1/phpMyAdmin-5.2.1-all-languages.tar.gz
+        dest: /usr/share/
+        remote_src: yes
+        creates: /usr/share/phpMyAdmin-5.2.1-all-languages
+
+    - name: Rename phpMyAdmin directory
+      command: mv /usr/share/phpMyAdmin-5.2.1-all-languages /usr/share/phpmyadmin
+      args:
+        creates: /usr/share/phpmyadmin
+
+    - name: Find PHP-FPM socket path dynamically
+      shell: ls /var/run/php/php*-fpm.sock | head -n 1
+      register: php_sock
+      changed_when: false
+
+    - name: Configure Nginx server block for website and phpMyAdmin
+      copy:
+        force: no
+        dest: "/etc/nginx/sites-available/{{ domain_name }}"
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }} www.{{ domain_name }};
+              root /home/{{ wp_user }}/{{ domain_name }}/public;
+              index index.php index.html index.htm;
+
+              location / {
+                  try_files $uri $uri/ /index.php?$args;
+              }
+
+              location ~ \.php$ {
+                  include snippets/fastcgi-php.conf;
+                  fastcgi_pass unix:{{ php_sock.stdout }};
+              }
+
+              location /phpmyadmin {
+                  root /usr/share/;
+                  index index.php index.html index.htm;
+                  location ~ ^/phpmyadmin/(.+\.php)$ {
+                      try_files $uri =404;
+                      root /usr/share/;
+                      fastcgi_pass unix:{{ php_sock.stdout }};
+                      include fastcgi_params;
+                      fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+                  }
+                  location ~* ^/phpmyadmin/(.+\.(jpg|jpeg|gif|css|png|js|ico|html|xml|txt))$ {
+                      root /usr/share/;
+                  }
+              }
+          }
+      notify: Reload Nginx
+
+    - name: Enable Nginx site
+      file:
+        src: "/etc/nginx/sites-available/{{ domain_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ domain_name }}"
+        state: link
+      notify: Reload Nginx
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload Nginx
+
+
+    - name: Install Certbot and Nginx plugin
+      apt:
+        name:
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    - name: Obtain and install Let's Encrypt SSL certificate
+      command: certbot --nginx -d {{ domain_name }} --non-interactive --agree-tos --register-unsafely-without-email --redirect
+      args:
+        creates: /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem
+      ignore_errors: yes
+
+    - name: Download and extract WordPress
+      unarchive:
+        src: https://wordpress.org/latest.tar.gz
+        dest: "/home/{{ wp_user }}/{{ domain_name }}/public"
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+        owner: "{{ wp_user }}"
+        group: "{{ wp_user }}"
+        creates: "/home/{{ wp_user }}/{{ domain_name }}/public/wp-settings.php"
+
+    - name: Create wp-config.php from sample
+      copy:
+        src: "/home/{{ wp_user }}/{{ domain_name }}/public/wp-config-sample.php"
+        dest: "/home/{{ wp_user }}/{{ domain_name }}/public/wp-config.php"
+        remote_src: yes
+        owner: "{{ wp_user }}"
+        group: "{{ wp_user }}"
+        force: no
+
+    - name: Update WordPress database credentials in wp-config.php
+      replace:
+        path: "/home/{{ wp_user }}/{{ domain_name }}/public/wp-config.php"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+      loop:
+        - { regexp: 'database_name_here', replace: "{{ db_name }}" }
+        - { regexp: 'username_here', replace: "{{ db_user }}" }
+        - { regexp: 'password_here', replace: "{{ db_pass }}" }
+
+  handlers:
+    - name: Restart SSH
+      systemd:
+        name: ssh
+        state: restarted
+
+    - name: Reload Nginx
+      systemd:
+        name: nginx
+        state: reloaded
